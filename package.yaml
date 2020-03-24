@@ -23,6 +23,7 @@ dependencies:
 - base >= 4.7 && < 5
 - template-haskell
 - transformers
+- conduit-extra
 - containers
 - memory
 - conduit
@@ -31,10 +32,12 @@ dependencies:
 - bytestring
 - base64-bytestring
 - directory
+- resourcet
 - text
 
 library:
-  source-dirs: src
+  source-dirs:
+  - src
 
 executables:
   hie-test-exe:
@@ -47,13 +50,3 @@ executables:
     dependencies:
     - hie-test
 
-tests:
-  hie-test-test:
-    main:                Spec.hs
-    source-dirs:         test
-    ghc-options:
-    - -threaded
-    - -rtsopts
-    - -with-rtsopts=-N
-    dependencies:
-    - hie-test

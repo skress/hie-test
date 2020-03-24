@@ -6,25 +6,32 @@ module Lib
     , staticFiles
     ) where
 
-import System.Directory
+import Debug.Trace
+
+import Conduit
 import Control.Monad
-import qualified Data.ByteArray as ByteArray
-import Crypto.Hash (MD5, Digest)
-import Data.List (intercalate, foldl')
-import Data.Char (isLower, isDigit)
-import Language.Haskell.TH
-import Language.Haskell.TH.Syntax as TH
+import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Trans.State
-import qualified Data.Map as M
+import Control.Monad.Trans.Resource (runResourceT)
+import Crypto.Hash (Digest, HashAlgorithm, MD5)
+import qualified Crypto.Hash as Hash (hash, hashFinalize, hashUpdate, hashInit)
+import qualified Data.ByteArray as ByteArray
 import qualified Data.ByteString.Char8 as S8
 import qualified Data.ByteString as S
 import qualified Data.ByteString.Base64
-import Crypto.Hash.Conduit (hashFile, sinkHash)
-import Conduit
+import Data.Char (isLower, isDigit)
+import Data.Conduit
+import Data.Conduit.Binary (sourceFile)
+import Data.List (intercalate, foldl')
+import qualified Data.Map as M
 import Data.Text (Text)
+import Language.Haskell.TH.Syntax as TH
+import System.Directory
 
 someFunc :: IO ()
-someFunc = putStrLn "someFunc"
+someFunc = do
+    files <- getFileListPieces "./src"
+    putStrLn $ "File: " ++ intercalate ", " (map (intercalate "/") files)
 
 --newtype Static = Static StaticSettings
 newtype Static = Static Text
@@ -76,12 +83,12 @@ mkStaticFilesList' fp fs makeHash = do
                         | isDigit (head name') -> '_' : name'
                         | isLower (head name') -> name'
                         | otherwise -> '_' : name'
-        f' <- [|map pack $(TH.lift f)|]
+        f' <- trace ("XXXX mkStaticFilesList' map pack for alias=" ++ show alias ++ ", f=" ++ show f) $ [|map pack $(TH.lift f)|]
         qs <- if makeHash
-                    then do hash <- qRunIO $ base64md5File $ pathFromRawPieces fp f
-                            [|[(pack "etag", pack $(TH.lift hash))]|]
+                    then do hash <- trace "XXXX mkStaticFilesList' qRunIO" $ qRunIO $ base64md5File $ pathFromRawPieces fp f
+                            trace "XXXX mkStaticFilesList' pack etag" $ [|[(pack "etag", pack "XXX")]|]
                     else return $ ListE []
-        return
+        trace "XXXX mkStaticFilesList' return" $ return
             [ SigD routeName $ ConT ''StaticRoute
             , FunD routeName
                 [ Clause [] (NormalB $ (ConE 'StaticRoute) `AppE` f' `AppE` qs) []
@@ -89,16 +96,18 @@ mkStaticFilesList' fp fs makeHash = do
             ]
 
 getFileListPieces :: FilePath -> IO [[String]]
-getFileListPieces = flip evalStateT M.empty . flip go id
+getFileListPieces = do
+  result <- flip evalStateT M.empty . flip go id
+  trace "XXXX getFileListPieces - return" return result
   where
     go :: String
        -> ([String] -> [String])
        -> StateT (M.Map String String) IO [[String]]
     go fp front = do
-        allContents <- liftIO $ filter notHidden `fmap` getDirectoryContents fp
+        allContents <- trace "XXXX getFileListPieces - 1" $ liftIO $ filter notHidden `fmap` getDirectoryContents fp
         let fullPath :: String -> String
             fullPath f = fp ++ '/' : f
-        files <- liftIO $ filterM (doesFileExist . fullPath) allContents
+        files <- trace "XXXX getFileListPieces - 2" $ liftIO $ filterM (doesFileExist . fullPath) allContents
         let files' = map (front . return) files
         files'' <- mapM dedupe files'
         dirs <- liftIO $ filterM (doesDirectoryExist . fullPath) allContents
@@ -119,22 +128,25 @@ getFileListPieces = flip evalStateT M.empty . flip go id
                 return s
 
 base64md5File :: FilePath -> IO String
-base64md5File = fmap (base64 . encode) . hashFile
+base64md5File fp = trace "XXXX base64md5File" $ do
+    hashed <- hashFile fp
+    let encoded = trace ("XXXX base64md5File hashed=" ++ show hashed) $ encode hashed
+    return $ trace "XXXX base64md5File return" $ base64 encoded
     where encode d = ByteArray.convert (d :: Digest MD5)
 
 
 base64 :: S.ByteString -> String
-base64 = map tr
-       . take 8
-       . S8.unpack
-       . Data.ByteString.Base64.encode
+base64 = trace "XXXX base64" $ map tr
+       . (trace "XXXX base64 - take" $ take 8)
+       . (trace "XXXX base64 - unpack" $ S8.unpack)
+       . (trace "XXXX base64 - encode" $ Data.ByteString.Base64.encode)
   where
     tr '+' = '-'
     tr '/' = '_'
     tr c   = c
 
 pathFromRawPieces :: FilePath -> [String] -> FilePath
-pathFromRawPieces =
+pathFromRawPieces = trace "XXXX pathFromRawPieces" $ 
     foldl' append
   where
     append a b = a ++ '/' : b
@@ -145,3 +157,28 @@ notHidden s =
     case s of
         '.':_ -> False
         _ -> True
+
+-- | A 'Sink' that hashes a stream of 'B.ByteString'@s@ and
+-- creates a digest @d@.
+sinkHash :: (Monad m, HashAlgorithm hash) => Consumer S.ByteString m (Digest hash)
+sinkHash = trace "XXXX sinkHash" $ sink Hash.hashInit
+  where sink ctx = do
+            b <- trace "XXXX sinkHash - await" $ await
+            case b of
+                Nothing -> trace "XXXX sinkHash Nothing" $ return $! Hash.hashFinalize ctx
+                Just bs -> trace "XXXX! sinkHash Just" $ sink $! Hash.hashUpdate ctx bs
+
+-- | Hashes the whole contents of the given file in constant
+-- memory.  This function is just a convenient wrapper around
+-- 'sinkHash' defined as:
+--
+-- @
+-- hashFile fp = 'liftIO' $ 'runResourceT' ('sourceFile' fp '$$' 'sinkHash')
+-- @
+hashFile :: (MonadIO m, HashAlgorithm hash) => FilePath -> m (Digest hash)
+hashFile fp = liftIO $ trace "XXXX hashFile" $ runResourceT (sourceFile fp $$ sinkHash)
+
+hashFile' :: (MonadIO m, HashAlgorithm hash) => FilePath -> m (Digest hash)
+hashFile' fp = do
+    contents <- liftIO $ trace "XXXX hashFile" $ S.readFile fp
+    return $ Hash.hash  contents

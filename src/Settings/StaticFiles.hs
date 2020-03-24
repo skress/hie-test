@@ -7,4 +7,4 @@ import Data.Text
 import Data.String
 import Lib (staticFiles)
 
-staticFiles "./"
+staticFiles "./src"
